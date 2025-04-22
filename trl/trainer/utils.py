@@ -66,6 +66,8 @@ if is_comet_available():
 if is_peft_available():
     from peft import LoraConfig, PeftConfig
 
+from typing import Callable, Tuple, List, Dict
+
 
 class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
     """
@@ -1160,7 +1162,7 @@ def first_true_indices(bools: torch.Tensor, dtype=torch.long):
     return torch.min(zero_or_index, dim=-1).values
 
 
-def get_reward(
+def get_predicted_reward(
     model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -1185,7 +1187,8 @@ def get_reward(
             - `sequence_lengths` (`torch.Tensor`):
                 The lengths of the sequences in the query responses.
     """
-    attention_mask = query_responses != pad_token_id
+   # This is the original code 
+    """attention_mask = query_responses != pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     lm_backbone = getattr(model, model.base_model_prefix)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
@@ -1207,7 +1210,59 @@ def get_reward(
             sequence_lengths,
         ].squeeze(-1),
         sequence_lengths,
+    )"""
+    # This is the custom code 
+    attention_mask = query_responses != pad_token_id
+    position_ids = attention_mask.cumsum(1) - attention_mask.long()
+
+    # Extract model backbone (value model or reward model)
+    lm_backbone = getattr(model, model.base_model_prefix)
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+
+    output = lm_backbone(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        return_dict=True,
+        output_hidden_states=True,
+        use_cache=False
     )
+
+    # For value model, we don't need score, just use hidden states directly
+    value_logits = output.hidden_states[-1][:, context_length - 1 : -1].squeeze(-1)
+    return (value_logits, value_logits, torch.ones_like(value_logits))
+
+
+def get_reward(
+    custom_reward_function: Callable[[torch.Tensor, PreTrainedTokenizerBase, pd.DataFrame, int], torch.Tensor],
+    query_responses: torch.Tensor,
+    tokenizer: PreTrainedTokenizerBase,
+    ground_truth_labels: pd.DataFrame,
+    context_length: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute reward tensors for a batch of query responses using a custom reward function.
+
+    Args:
+        custom_reward_function: Function that computes per-sample rewards based on decoded responses.
+        query_responses (torch.Tensor): Tensor of shape [batch_size, seq_len] with tokenized responses.
+        tokenizer (PreTrainedTokenizerBase): HuggingFace tokenizer used to decode the responses.
+        context_length (int): Length of the context portion to skip when evaluating the response.
+        ground_truth_labels (pd.DataFrame): Ground truth labels to compare against predictions. Dataframe with columns:
+
+    Returns:
+        Tuple containing:
+            - dummy_logits (torch.Tensor): Tensor of zeros with shape [batch_size, seq_len]
+            - scores (torch.Tensor): 1D Tensor of shape [batch_size] with computed reward scores
+            - dummy_sequence_lengths (torch.Tensor): Tensor of shape [batch_size] indicating sequence end positions
+    """
+
+    scores = custom_reward_function(query_responses, tokenizer, ground_truth_labels, context_length)
+    dummy_logits = torch.zeros_like(query_responses)
+    dummy_sequence_lengths = torch.full((query_responses.size(0),), query_responses.size(1) - 1)
+    return (dummy_logits, scores, dummy_sequence_lengths)
+    
+
 
 
 def forward(
