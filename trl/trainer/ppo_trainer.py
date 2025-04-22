@@ -59,6 +59,7 @@ from .utils import (
     forward,
     generate_model_card,
     get_comet_experiment_url,
+    get_predicted_reward,
     get_reward,
     log_table_to_comet_experiment,
     peft_module_casting_to_bf16,
@@ -114,6 +115,7 @@ class PPOTrainer(Trainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
         peft_config: Optional["PeftConfig"] = None,
+        reward_ground_truth_dataset: pd.DataFrame = pd.DataFrame()
     ) -> None:
         if ref_model is model:
             raise ValueError(
@@ -124,6 +126,7 @@ class PPOTrainer(Trainer):
         self.args = args
         self.processing_class = processing_class
         self.policy_model = model
+        self.reward_ground_truth_dataset = reward_ground_truth_dataset
 
         # Define the collator if not provided
         if data_collator is None:
@@ -222,7 +225,8 @@ class PPOTrainer(Trainer):
         #########
         # setup model, optimizer, and others
         #########
-        for module in [self.policy_model, self.ref_model, self.value_model, self.reward_model]:
+        #for module in [self.policy_model, self.ref_model, self.value_model, self.reward_model]:
+        for module in [self.policy_model, self.ref_model, self.value_model]:
             if module is not None:
                 disable_dropout_in_model(module)
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
@@ -305,7 +309,7 @@ class PPOTrainer(Trainer):
                     raise ValueError("No reference model and model is not a Peft model.")
             else:
                 self.ref_model = self.ref_model.to(self.accelerator.device)
-            self.reward_model = self.reward_model.to(self.accelerator.device)
+            #self.reward_model = self.reward_model.to(self.accelerator.device)
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
@@ -352,6 +356,7 @@ class PPOTrainer(Trainer):
         processing_class = self.processing_class
         dataloader = self.dataloader
         device = accelerator.device
+        reward_ground_truth = self.reward_ground_truth_dataset
 
         def repeat_generator():
             while True:
@@ -461,13 +466,17 @@ class PPOTrainer(Trainer):
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                    full_value, _, _ = get_reward(
+                    print("Calculate predicted reward")
+                    full_value, _, _ = get_predicted_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    #_, score, _ = get_reward(
+                    #    reward_model, postprocessed_query_response, processing_class, context_length
+                    #)
+                    print("Calculate reward")
                     _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
-                    )
+                        self.reward_model, postprocessed_query_response, processing_class, reward_ground_truth, context_length)
 
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
@@ -722,9 +731,12 @@ class PPOTrainer(Trainer):
                     )
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
-                    )
+                    #_, score, _ = get_reward(
+                    #    self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    #)
+                    print("Calculate reward with accelerator cpu")
+                    _, score, _= get_reward(
+                        self.reward_model, postprocessed_query_response, processing_class, reward_ground_truth, context_length)
                     table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
 
                 if sampling:
